@@ -33,6 +33,7 @@ from .const import (
     DOMAIN,
     MARKET_HOURS,
     PERFORMANCE_UPDATE_INTERVAL,
+    REFRESH_TOKEN_BUFFER,
     TOKEN_MIN_VALIDITY,
     TOKEN_REFRESH_BUFFER,
 )
@@ -275,7 +276,15 @@ class SaxoCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             return False
 
     async def _check_and_refresh_token(self) -> None:
-        """Check token expiry and refresh if needed."""
+        """Check token expiry and refresh if needed.
+
+        This method checks both refresh token and access token expiry:
+        1. First checks if refresh token will expire soon (proactive refresh)
+        2. Then checks if access token needs refresh
+
+        This ensures we refresh the access token before the refresh token expires,
+        allowing us to get a new refresh token (if Saxo supports refresh token rotation).
+        """
         async with self._token_refresh_lock:
             token_data = self.config_entry.data.get("token", {})
             expires_at = token_data.get("expires_at")
@@ -284,25 +293,81 @@ class SaxoCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 _LOGGER.warning("No token expiry information available")
                 return
 
-            # Check if token needs refresh
-            expiry_time = datetime.fromtimestamp(expires_at)
-            refresh_time = expiry_time - TOKEN_REFRESH_BUFFER
             current_time = datetime.now()
+            expiry_time = datetime.fromtimestamp(expires_at)
+
+            # STEP 1: Check if refresh token will expire soon (CRITICAL)
+            # We need to check this FIRST, independently of access token expiry
+            refresh_token_expires_in = token_data.get("refresh_token_expires_in")
+            if refresh_token_expires_in:
+                # Calculate when the refresh token expires
+                # Use stored token_issued_at timestamp if available, otherwise calculate from expiry
+                token_issued_at_timestamp = token_data.get("token_issued_at")
+
+                if token_issued_at_timestamp:
+                    # Use the stored timestamp (most accurate)
+                    token_issued_at = datetime.fromtimestamp(token_issued_at_timestamp)
+                else:
+                    # Fallback: calculate from access token expiry (legacy behavior)
+                    token_issued_at = expiry_time - timedelta(
+                        seconds=token_data.get("expires_in", 1200)
+                    )
+
+                refresh_token_expires_at = token_issued_at + timedelta(
+                    seconds=refresh_token_expires_in
+                )
+                refresh_token_refresh_time = (
+                    refresh_token_expires_at - REFRESH_TOKEN_BUFFER
+                )
+
+                _LOGGER.debug(
+                    "Refresh token expires at %s (will refresh at %s, lifetime: %d seconds)",
+                    refresh_token_expires_at.isoformat(),
+                    refresh_token_refresh_time.isoformat(),
+                    refresh_token_expires_in,
+                )
+
+                # Check if refresh token has ALREADY expired
+                if current_time >= refresh_token_expires_at:
+                    _LOGGER.error(
+                        "Refresh token has expired (expired at %s, current time %s). Cannot refresh - reauth required.",
+                        refresh_token_expires_at.isoformat(),
+                        current_time.isoformat(),
+                    )
+                    _LOGGER.info(
+                        "Please re-authenticate: Go to Settings > Devices & Services > Saxo Portfolio and click the 'Reauthenticate' button"
+                    )
+                    raise ConfigEntryAuthFailed(
+                        "Refresh token expired - please click the reauthentication button in Settings > Devices & Services"
+                    )
+
+                # Check if refresh token WILL expire soon (proactive refresh)
+                if current_time >= refresh_token_refresh_time:
+                    _LOGGER.warning(
+                        "Refresh token will expire soon (%s remaining). Proactively refreshing to get new refresh token.",
+                        refresh_token_expires_at - current_time,
+                    )
+                    await self._refresh_oauth_token()
+                    self._last_token_check = current_time
+                    return  # Done - we refreshed proactively
+
+            # STEP 2: Check if access token needs refresh (normal flow)
+            refresh_time = expiry_time - TOKEN_REFRESH_BUFFER
 
             if current_time >= refresh_time:
                 _LOGGER.debug(
-                    "Token needs refresh (expires at %s, refresh buffer %s)",
+                    "Access token needs refresh (expires at %s, refresh buffer %s)",
                     expiry_time.isoformat(),
                     TOKEN_REFRESH_BUFFER,
                 )
 
                 # Validate token still has minimum validity
                 if current_time >= (expiry_time - TOKEN_MIN_VALIDITY):
-                    _LOGGER.debug("Token expires very soon, immediate refresh needed")
+                    _LOGGER.debug(
+                        "Access token expires very soon, immediate refresh needed"
+                    )
 
                 await self._refresh_oauth_token()
-
-                # Update last token check time
                 self._last_token_check = current_time
 
     async def _refresh_oauth_token(self) -> dict[str, Any]:
@@ -346,27 +411,10 @@ class SaxoCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # Use Home Assistant's aiohttp session
             session = async_get_clientsession(self.hass)
 
-            # Saxo requires: grant_type, refresh_token, and redirect_uri
-            refresh_data = {
-                "grant_type": "refresh_token",
-                "refresh_token": refresh_token,
-            }
-
-            # Get redirect_uri from the original OAuth flow (required by Saxo)
-            redirect_uri = self.config_entry.data.get("redirect_uri")
-            if not redirect_uri:
-                # Fallback to default Home Assistant OAuth redirect URI
-                redirect_uri = "https://my.home-assistant.io/redirect/oauth"
-                _LOGGER.info(
-                    "No redirect_uri in config entry, using fallback: %s (consider reconfiguring integration)",
-                    redirect_uri,
-                )
-
-            refresh_data["redirect_uri"] = redirect_uri
-            _LOGGER.debug("Added redirect_uri to refresh request: %s", redirect_uri)
-
-            # Get client credentials for HTTP Basic Auth (Saxo's preferred method)
+            # Get client credentials and redirect_uri from OAuth implementation
             auth = None
+            redirect_uri = None
+            client_id = None
             try:
                 from homeassistant.helpers.config_entry_oauth2_flow import (
                     async_get_config_entry_implementation,
@@ -377,19 +425,73 @@ class SaxoCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     self.hass, self.config_entry
                 )
                 if implementation:
+                    client_id = implementation.client_id
                     auth = aiohttp.BasicAuth(
                         implementation.client_id, implementation.client_secret
                     )
-                    _LOGGER.debug(
-                        "Using HTTP Basic Auth for token refresh (Saxo preferred method)"
+                    _LOGGER.info(
+                        "Using HTTP Basic Auth for token refresh with client_id: %s",
+                        client_id[:8] + "..." if len(client_id) > 8 else client_id,
+                    )
+
+                    # Get the correct redirect_uri from the OAuth implementation
+                    # This ensures we use the same redirect_uri that was used during initial authorization
+                    if hasattr(implementation, "redirect_uri"):
+                        redirect_uri = implementation.redirect_uri
+                        _LOGGER.info(
+                            "Using redirect_uri from OAuth implementation: %s",
+                            redirect_uri,
+                        )
+                    else:
+                        _LOGGER.warning(
+                            "OAuth implementation has no redirect_uri property"
+                        )
+                else:
+                    _LOGGER.error("Could not get OAuth implementation for Basic Auth")
+            except Exception as e:
+                _LOGGER.error(
+                    "Failed to get OAuth implementation: %s: %s",
+                    type(e).__name__,
+                    str(e),
+                )
+
+            # Fallback to stored redirect_uri if we couldn't get it from implementation
+            if not redirect_uri:
+                redirect_uri = self.config_entry.data.get("redirect_uri")
+                if redirect_uri:
+                    _LOGGER.info(
+                        "Using redirect_uri from config entry: %s", redirect_uri
                     )
                 else:
-                    _LOGGER.warning("Could not get OAuth implementation for Basic Auth")
-            except Exception as e:
-                _LOGGER.error("Failed to set up HTTP Basic Auth: %s", type(e).__name__)
-                _LOGGER.debug("Exception details: %s", str(e))
+                    _LOGGER.error(
+                        "No redirect_uri found in OAuth implementation or config entry. This will likely cause token refresh to fail."
+                    )
+                    _LOGGER.error(
+                        "Please reconfigure the integration or check your Saxo application redirect_uri configuration."
+                    )
 
-            _LOGGER.debug("Attempting Saxo-compliant token refresh")
+            # Build refresh request data
+            # According to Saxo documentation, we need: grant_type, refresh_token, redirect_uri
+            refresh_data = {
+                "grant_type": "refresh_token",
+                "refresh_token": refresh_token,
+            }
+
+            # Only add redirect_uri if we have one
+            if redirect_uri:
+                refresh_data["redirect_uri"] = redirect_uri
+                _LOGGER.info("Token refresh will use redirect_uri: %s", redirect_uri)
+            else:
+                _LOGGER.warning("Token refresh without redirect_uri (may fail)")
+
+            # Log client_id being used (for debugging auth issues)
+            if client_id:
+                _LOGGER.info(
+                    "Token refresh using client_id: %s",
+                    client_id[:8] + "..." if len(client_id) > 8 else client_id,
+                )
+            else:
+                _LOGGER.error("No client_id available for token refresh")
 
             # Debug logging with masked sensitive data
             masked_data = refresh_data.copy()
@@ -425,12 +527,12 @@ class SaxoCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 if response.status in [200, 201]:  # Accept both 200 OK and 201 Created
                     new_token_data = await response.json()
 
-                    # Calculate expiry time
+                    # Calculate expiry time and store when token was issued
+                    current_timestamp = datetime.now().timestamp()
                     expires_in = new_token_data.get("expires_in", 1200)
-                    expires_at = (
-                        datetime.now() + timedelta(seconds=expires_in)
-                    ).timestamp()
+                    expires_at = current_timestamp + expires_in
                     new_token_data["expires_at"] = expires_at
+                    new_token_data["token_issued_at"] = current_timestamp
 
                     # Preserve any existing data from original token (like redirect_uri)
                     # Saxo may provide a new refresh_token, so we use the response data
@@ -484,6 +586,23 @@ class SaxoCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         response.status,
                         error_text[:500] if error_text else "No error details",
                     )
+
+                    # Provide helpful guidance for 401 errors
+                    if response.status == 401:
+                        _LOGGER.error(
+                            "401 Unauthorized error during token refresh. Possible causes:"
+                        )
+                        _LOGGER.error(
+                            "1. redirect_uri mismatch: The redirect_uri used (%s) may not match what's configured in your Saxo application",
+                            redirect_uri if redirect_uri else "NONE",
+                        )
+                        _LOGGER.error(
+                            "2. Invalid client credentials: Check that your Saxo App Key and App Secret are correct in Application Credentials"
+                        )
+                        _LOGGER.error(
+                            "3. Try reconfiguring the integration: Go to Settings > Devices & Services > Saxo Portfolio > Configure"
+                        )
+
                     raise ConfigEntryAuthFailed("Failed to refresh access token")
 
         except Exception as e:
@@ -864,6 +983,10 @@ class SaxoCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     self._performance_last_updated = datetime.now()
                     _LOGGER.debug("Updated performance data cache")
 
+                    # Update config entry title with client ID for better identification
+                    # This helps users identify which account needs reauthentication
+                    self._update_config_entry_title_if_needed(client_id)
+
                 # Create simple data structure for balance sensors
                 return {
                     "cash_balance": balance_data.get("CashBalance", 0.0),
@@ -935,6 +1058,14 @@ class SaxoCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         except APIError as e:
             _LOGGER.error("API error fetching portfolio data: %s", type(e).__name__)
             raise UpdateFailed("API error") from e
+
+        except ConfigEntryAuthFailed:
+            # Re-raise authentication failures to trigger reauth flow in Home Assistant
+            # This must be caught before the generic Exception handler
+            _LOGGER.info(
+                "Authentication failed - Home Assistant will display reauthentication prompt"
+            )
+            raise
 
         except Exception as e:
             _LOGGER.exception("Unexpected error fetching portfolio data")
@@ -1228,6 +1359,36 @@ class SaxoCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         _LOGGER.debug(
             "Marked setup as complete for entry %s", self.config_entry.entry_id
         )
+
+    def _update_config_entry_title_if_needed(self, client_id: str) -> None:
+        """Update config entry title to include Client ID for identification.
+
+        When multiple integrations are configured, this makes it clear which
+        account each integration represents, especially during reauthentication.
+
+        Args:
+            client_id: The Saxo Client ID to include in the title
+
+        """
+        if client_id == "unknown":
+            return
+
+        current_title = self.config_entry.title
+        expected_title = f"Saxo Portfolio ({client_id})"
+
+        # Only update if title is still generic (doesn't already include client ID)
+        if current_title == "Saxo Portfolio" or (
+            "(" not in current_title and client_id not in current_title
+        ):
+            _LOGGER.info(
+                "Updating config entry title from '%s' to '%s' for better identification",
+                current_title,
+                expected_title,
+            )
+            self.hass.config_entries.async_update_entry(
+                self.config_entry,
+                title=expected_title,
+            )
 
     @property
     def is_startup_phase(self) -> bool:

@@ -1,6 +1,6 @@
 # ha-saxo Development Guidelines
 
-Auto-generated from current implementation. Last updated: 2025-09-30
+Auto-generated from current implementation. Last updated: 2026-01-01
 
 ## Active Technologies
 - Home Assistant Custom Integration
@@ -12,11 +12,13 @@ Auto-generated from current implementation. Last updated: 2025-09-30
 ## Project Structure
 ```
 custom_components/saxo_portfolio/
-├── __init__.py                 # Integration setup
+├── __init__.py                 # Integration setup and service registration
+├── button.py                   # Refresh button entity
 ├── config_flow.py             # OAuth configuration flow with prefix support
 ├── coordinator.py             # Data update coordinator with market hours logic
 ├── sensor.py                  # Sixteen optimized sensors with shared base classes and automatic client ID naming
 ├── const.py                   # Constants and configuration
+├── services.yaml              # Service definitions
 ├── application_credentials.py  # OAuth credential management
 └── api/
     ├── __init__.py
@@ -73,6 +75,9 @@ python -m py_compile custom_components/saxo_portfolio/sensor.py
 - **Long-term Statistics**: All balance sensors support Home Assistant long-term statistics for historical tracking and trend analysis
 - **Comprehensive Diagnostics**: Built-in diagnostic support and real-time monitoring sensors
 - **Optimized Architecture**: Shared base classes reduce code duplication by 31% while maintaining all functionality
+- **Manual Refresh**: Button entity and service for on-demand data refresh
+  - `SaxoRefreshButton` - Press to trigger immediate data refresh
+  - `saxo_portfolio.refresh_data` service - Refresh all accounts via automations or Developer Tools
 
 ### Entity Naming Pattern
 - All entities use Client ID: `sensor.saxo_{client_id}_{sensor_type}`
@@ -93,6 +98,7 @@ python -m py_compile custom_components/saxo_portfolio/sensor.py
   - `sensor.saxo_123456_market_status` (diagnostic)
   - `sensor.saxo_123456_last_update` (diagnostic)
   - `sensor.saxo_123456_timezone` (diagnostic)
+  - `button.saxo_123456_refresh` (configuration)
 - Device: `"Saxo {ClientId} Portfolio"`
 
 ### Configuration Options
@@ -100,6 +106,17 @@ python -m py_compile custom_components/saxo_portfolio/sensor.py
 - Production endpoints only (no environment selection)
 - Automatic token refresh with proper security handling
 - Entity names automatically generated from Saxo Client ID
+
+### GUI-Based Reauthentication
+- **Seamless Token Refresh**: When OAuth tokens expire, Home Assistant automatically displays a reauthentication button in the UI
+- **No Data Loss**: Reauthentication preserves all configuration settings (timezone, etc.) and entity history
+- **User-Friendly Flow**: Users simply click the reauthentication button and complete the OAuth flow without removing the integration
+- **Automatic Detection**: The coordinator detects expired/invalid tokens and triggers the reauth flow automatically
+- **Implementation Details**:
+  - `async_step_reauth()` in config_flow.py:201-215 handles the reauth flow initiation
+  - `async_oauth_create_entry()` in config_flow.py:112-142 detects reauth flows and updates existing config entry
+  - Coordinator raises `ConfigEntryAuthFailed` when tokens expire (coordinator.py:327, 354, 573, 577, 985)
+  - All configuration preserved during reauth - only OAuth tokens are updated
 
 ### Long-term Statistics Support
 - **Full Support**: All balance sensors support long-term statistics in Home Assistant
@@ -193,6 +210,49 @@ max_failure_time = max(15 * 60, 3 * update_interval_seconds)
 - `api/saxo_client.py:585-625`: get_performance_v4_ytd() method for year-to-date performance
 - `const.py:119`: PERFORMANCE_UPDATE_INTERVAL constant (2 hours as of v2.2.9)
 - `tests/integration/test_sticky_availability.py`: Comprehensive tests for availability behavior (8 tests pass)
+- `button.py`: Refresh button entity for manual data updates
+- `services.yaml`: Service definitions for `refresh_data` service
+- `__init__.py:61-79`: Service registration in async_setup_entry()
+- `__init__.py:134-138`: Service cleanup in async_unload_entry()
+
+### Manual Refresh Feature
+
+#### Refresh Button Entity
+- **`SaxoRefreshButton`** in `button.py`: Button entity for triggering manual data refresh
+  - Device class: `ButtonDeviceClass.UPDATE`
+  - Entity category: `EntityCategory.CONFIG` (appears under device configuration)
+  - Entity ID: `button.saxo_{client_id}_refresh`
+  - Icon: `mdi:refresh`
+  - Pressing the button calls `coordinator.async_refresh()` for immediate data fetch
+
+#### Refresh Data Service
+- **Service**: `saxo_portfolio.refresh_data`
+- **Description**: Manually refresh portfolio data from Saxo Bank API
+- **Usage**:
+  - Developer Tools → Services → `saxo_portfolio.refresh_data`
+  - Automations: `action: saxo_portfolio.refresh_data`
+- **Behavior**: Refreshes all registered Saxo Portfolio coordinators (supports multiple accounts)
+- **Implementation**:
+  - Service registered once per domain (not per config entry)
+  - Service removed when last config entry is unloaded
+  - Defined in `services.yaml` and `strings.json`
+
+## Recent Changes (v2.4.0)
+- **Manual Refresh Button**: Added `SaxoRefreshButton` entity to each device for on-demand data refresh
+- **Refresh Data Service**: Added `saxo_portfolio.refresh_data` service for automation/UI triggering
+- **Multi-language Support**: Button translations added to all 11 supported languages
+
+## Recent Changes (v2.3.0)
+- **GUI-Based Reauthentication**: Added seamless reauthentication flow when OAuth tokens expire
+  - Users can now reauthenticate directly from the Home Assistant UI without removing and re-adding the integration
+  - Home Assistant automatically displays a "Reauthenticate" button when tokens expire or become invalid
+  - All configuration settings (timezone, etc.) and entity history are preserved during reauthentication
+  - Only OAuth tokens are updated - no data loss or configuration changes
+  - Enhanced `async_step_reauth()` in config_flow.py:201-215 to properly handle reauth flow
+  - Updated `async_oauth_create_entry()` in config_flow.py:112-142 to detect and handle reauth flows
+  - Added `reauth_successful` message in strings.json for user feedback
+  - Coordinator already properly raises `ConfigEntryAuthFailed` to trigger reauth when needed
+  - Impact: Significantly improved user experience - no need to delete and re-add integration when tokens expire
 
 ## Recent Changes (v2.2.11)
 - **Critical Fix**: Fixed integration reloading every time OAuth token is refreshed

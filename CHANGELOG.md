@@ -5,6 +5,314 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.4.0] - 2026-01-01
+
+### Added
+- **Manual Refresh Button**: Added a refresh button entity to each device
+  - Entity ID: `button.saxo_{client_id}_refresh`
+  - Appears on device page under configuration entities
+  - Press to trigger immediate data refresh from Saxo Bank API
+  - Can be added to dashboards or used in automations
+  - Translations available in all 11 supported languages
+
+- **Refresh Data Service**: Added `saxo_portfolio.refresh_data` service
+  - Call from Developer Tools → Services or automations
+  - Refreshes all registered Saxo Portfolio accounts
+  - Bypasses normal update schedule for immediate data fetch
+
+### Technical Details
+- New `button.py` platform with `SaxoRefreshButton` entity
+- Service registered once per domain in `__init__.py`
+- Service automatically removed when last integration entry is unloaded
+- Button uses `ButtonDeviceClass.UPDATE` and `EntityCategory.CONFIG`
+
+## [2.3.9] - 2025-12-30
+
+### Fixed
+- **Reconfigure Dialog**: Fixed empty popup when clicking Reconfigure button
+  - Simplified reconfigure flow to use single step with proper HA method `_get_reconfigure_entry()`
+  - Changed step ID from `reconfigure_confirm` to `reconfigure` to match HA conventions
+  - Dialog now properly displays title and description
+
+### Added
+- **Multi-language Support**: Added translations for 11 languages
+  - English (en)
+  - German (de)
+  - French (fr)
+  - Spanish (es)
+  - Dutch (nl)
+  - Italian (it)
+  - Portuguese (pt)
+  - Danish (da)
+  - Swedish (sv)
+  - Norwegian Bokmål (nb)
+  - Finnish (fi)
+
+## [2.3.8] - 2025-12-30
+
+### Fixed
+- **Reconfigure Dialog Empty**: Fixed empty popup when clicking Reconfigure button
+  - Added missing `translations/en.json` file required by Home Assistant for runtime string loading
+  - Reconfigure dialog now displays title and description correctly
+
+## [2.3.7] - 2025-12-30
+
+### Added
+- **Manual Reauthentication Button**: Users can now proactively reauthenticate via the "Reconfigure" menu option
+  - Go to Settings → Devices & Services → Saxo Portfolio → three-dot menu → Reconfigure
+  - Useful for refreshing tokens before they expire
+  - Resolves authentication issues without removing the integration
+  - All settings, entity history, and automations are preserved
+
+### Technical Details
+- Added `async_step_reconfigure()` and `async_step_reconfigure_confirm()` in config_flow.py:268-302
+- Added `reconfigure_confirm` step strings in strings.json
+
+## [2.3.6] - 2025-12-30
+
+### Added
+- **Multi-Account Identification**: Config entry titles now include the Client ID for clear account identification
+  - Titles automatically update from "Saxo Portfolio" to "Saxo Portfolio (CLIENT_ID)" after first successful data fetch
+  - Makes it easy to identify which account each integration represents in Settings → Devices & Services
+
+### Changed
+- **Improved Reauthentication Dialog**: Updated reauth UI to display the account identifier
+  - Dialog title now shows "Reauthenticate Saxo Portfolio (CLIENT_ID)"
+  - Description clearly states which account needs reauthentication
+  - Essential for users with multiple Saxo accounts configured
+
+### Technical Details
+- Added `_update_config_entry_title_if_needed()` method in coordinator.py:1359-1387
+- Method updates config entry title only when:
+  - Client ID is successfully fetched (not "unknown")
+  - Title is still generic ("Saxo Portfolio") or doesn't contain Client ID
+- Updated strings.json reauth_confirm step to use `{title}` placeholder
+
+## [2.3.5] - 2025-11-17
+
+### Fixed
+- **Critical**: Fixed reauthentication button not appearing when tokens expire
+  - Added explicit `ConfigEntryAuthFailed` exception handler in coordinator.py:1058-1064
+  - Previously, `ConfigEntryAuthFailed` was caught by generic `except Exception` handler and converted to `UpdateFailed`
+  - `UpdateFailed` only makes sensors unavailable without triggering reauth flow
+  - Now `ConfigEntryAuthFailed` properly propagates to Home Assistant core to trigger reauth UI
+
+### Changed
+- Added dedicated exception handler for `ConfigEntryAuthFailed` before generic `Exception` handler
+- Handler re-raises the exception to allow Home Assistant to display reauthentication prompt
+- Added informative log message when authentication failure triggers reauth flow
+
+### Technical Details
+- **Root Cause**: Exception handling order in `_fetch_portfolio_data()` method
+  - Token refresh failures raise `ConfigEntryAuthFailed` at line 635
+  - Generic `except Exception` handler at line 1066 caught it and converted to `UpdateFailed`
+  - This prevented Home Assistant from detecting auth failure and showing reauth button
+- **Solution**: Added specific handler at line 1058 that re-raises `ConfigEntryAuthFailed` unchanged
+- **Flow**: Token expires → `_check_and_refresh_token()` raises `ConfigEntryAuthFailed` → new handler re-raises → Home Assistant shows reauth button
+
+### User Experience Improvements
+- **Before**: Tokens expire → sensors unavailable → no UI prompt → users confused
+- **After**: Tokens expire → sensors unavailable → reauthentication button appears in UI → users can easily reauth
+
+### How to Verify
+1. After upgrading to 2.3.5, wait for tokens to expire (or force expiry)
+2. Check Settings → Devices & Services → Saxo Portfolio
+3. You should now see the reauthentication prompt/button appear
+4. Click "Configure" or "Reauthenticate" to restore access
+
+## [2.3.4] - 2025-11-16
+
+### Fixed
+- **Critical**: Fixed missing reauthentication UI in Home Assistant
+  - Added `reauth_confirm` step to strings.json for proper UI display
+  - Added `async_step_reauth_confirm()` to show confirmation dialog before OAuth flow
+  - Users now see a clear "Reauthenticate Saxo Portfolio" dialog when tokens expire
+  - Dialog explains that settings and history will be preserved during reauth
+
+### Changed
+- Enhanced `async_step_reauth()` to show confirmation form first (config_flow.py:247-248)
+- Added `async_step_reauth_confirm()` method to handle user confirmation (config_flow.py:250-264)
+- Updated strings.json with reauth_confirm step configuration (lines 22-25)
+
+### User Experience Improvements
+- **Before**: ConfigEntryAuthFailed raised but no UI appeared → users confused
+- **After**: Clear dialog appears with "Submit" button → starts OAuth flow → seamless reauth
+- Dialog message: "Your Saxo Bank authentication has expired. Please sign in again to continue using the integration. All your settings, entity history, and automations will be preserved."
+
+### Technical Details
+- **Root Cause**: Missing reauth_confirm step in UI configuration prevented Home Assistant from displaying the reauthentication prompt
+- **Solution**: Added proper reauth confirmation flow following Home Assistant OAuth2 best practices
+- **Flow**: ConfigEntryAuthFailed → async_step_reauth → async_step_reauth_confirm (show form) → user clicks Submit → async_step_pick_implementation → OAuth flow
+
+### How to Trigger (After Upgrade)
+1. Wait for tokens to expire OR restart HA after this upgrade
+2. Look in Settings → Devices & Services
+3. You should now see one of:
+   - Yellow banner: "Authentication required for Saxo Portfolio"
+   - Integration card with warning badge
+   - Notification icon (🔔) with auth failure message
+4. Click "Configure" or "Reauthenticate"
+5. You'll see the new confirmation dialog
+6. Click "Submit" to start OAuth flow
+
+## [2.3.3] - 2025-11-16
+
+### Fixed
+- **Critical**: Fixed refresh token expiration by implementing proactive refresh token rotation
+  - Integration now checks refresh token expiry INDEPENDENTLY of access token expiry
+  - Proactively refreshes access token when refresh token has less than 5 minutes remaining
+  - Ensures we get a new refresh token before the old one expires (if Saxo supports refresh token rotation)
+  - Prevents "Refresh token has expired" errors when HA is running continuously
+  - Solves the core issue: access token expires in 20min, refresh token expires in 5min → now we refresh at 5min mark
+
+### Changed
+- Added `REFRESH_TOKEN_BUFFER` constant (5 minutes) in const.py:150-152
+- Enhanced `_check_and_refresh_token()` to check refresh token expiry first (coordinator.py:278-371)
+- Implemented two-step token validation:
+  - **STEP 1**: Check if refresh token will expire soon (proactive) - Lines 299-352
+  - **STEP 2**: Check if access token needs refresh (normal) - Lines 354-371
+- Added detailed logging for refresh token expiry monitoring
+
+### Technical Details
+- **Root Cause**: Old logic only checked refresh token when access token needed refresh, missing cases where refresh token expires before access token
+- **Example Scenario**:
+  - Access token expires in 20 minutes
+  - Refresh token expires in 5 minutes
+  - Old behavior: Wait 20 minutes → refresh token already expired ❌
+  - New behavior: Check at 5 minutes → proactive refresh → get new refresh token ✅
+- **Refresh Token Rotation**: If Saxo Bank provides a new refresh_token in the token refresh response, we now ensure we refresh often enough to keep getting new ones
+- **Compatibility**: Works alongside v2.3.2's accurate timestamp tracking
+
+### Important Notes
+- **This does NOT eliminate the need for reauthentication** - When HA is shut down longer than refresh token lifetime, manual reauth is still required (by design)
+- **This DOES prevent refresh token expiry** during normal HA operation by refreshing proactively
+- **Requires Saxo support**: If Saxo Bank does NOT provide new refresh tokens during token refresh, manual reauth will eventually be needed
+
+## [2.3.2] - 2025-11-16
+
+### Fixed
+- **Critical**: Fixed refresh token expiry calculation after Home Assistant shutdown
+  - Integration now stores `token_issued_at` timestamp during initial OAuth and token refresh
+  - Refresh token expiry is now calculated using actual issuance time instead of inferred time
+  - Prevents incorrect expiry calculations after the first token refresh
+  - Fixes issue where HA shutdown for hours could cause premature or missed refresh token expiry detection
+  - Includes backward compatibility fallback for existing installations without stored timestamp
+
+### Changed
+- Enhanced token refresh logic to store accurate token issuance timestamp (coordinator.py:498-510)
+- Updated refresh token expiry validation to use stored timestamp (coordinator.py:303-316)
+- Added `token_issued_at` timestamp storage during initial OAuth flow (config_flow.py:114-119)
+
+### Technical Details
+- **Root Cause**: After token refresh, the integration calculated `token_issued_at = expires_at - expires_in`, but this used the NEW access token expiry with the OLD refresh token lifetime, causing incorrect calculations
+- **Solution**: Store actual `token_issued_at` timestamp whenever tokens are obtained or refreshed
+- **Impact**: Prevents unnecessary reauthentication requests and ensures refresh tokens work correctly after long HA downtime
+- **Compatibility**: Existing installations automatically benefit after next token refresh
+
+## [2.3.1] - 2025-11-16
+
+### Changed
+- **Improved User Messaging**: Updated error messages to guide users to the reauthentication button
+  - Changed "Delete and re-add the integration" message to "click the Reauthenticate button"
+  - Reduced log level from ERROR to INFO for user guidance message
+  - Makes it clearer that users don't need to delete the integration when tokens expire
+  - Improves user experience by directing to the correct GUI-based reauth flow
+
+### Fixed
+- Updated expired token error message to properly guide users to the reauthentication button in Settings > Devices & Services
+- Prevents user confusion about needing to delete and re-add the integration
+
+## [2.3.0] - 2025-10-27
+
+### Added
+- **GUI-Based Reauthentication**: Seamless reauthentication flow when OAuth tokens expire
+  - Users can now reauthenticate directly from the Home Assistant UI
+  - Home Assistant automatically displays a "Reauthenticate" button when tokens expire or become invalid
+  - No need to delete and re-add the integration when tokens expire
+  - All configuration settings (timezone, entity customizations, etc.) are preserved
+  - All entity history and statistics are maintained
+  - Only OAuth tokens are updated during reauthentication
+
+### Changed
+- Enhanced `async_step_reauth()` in config_flow.py to properly initiate OAuth flow for reauthentication
+- Updated `async_oauth_create_entry()` in config_flow.py to detect reauth flows and update existing config entry
+- Added `_reauth_entry` tracking to flow handler to preserve config entry during reauth
+- Added user-facing success message for completed reauthentication
+
+### Technical Details
+- Reauth flow triggered automatically when coordinator raises `ConfigEntryAuthFailed`
+- Config entry is updated in place rather than creating a new entry
+- Integration reloads after successful reauth to apply new tokens
+- Preserves all existing data including timezone configuration and redirect_uri
+- Follows Home Assistant OAuth2 reauth best practices
+
+### User Impact
+- **Significantly improved user experience**: No more deleting and re-adding the integration
+- **No data loss**: All historical data and statistics are preserved
+- **Automatic detection**: System detects expired tokens and prompts for reauth
+- **One-click solution**: Simple button click starts the reauth process
+
+## [2.2.18] - 2025-10-27
+
+### Fixed
+- **Critical**: Fixed integration not detecting expired refresh tokens
+  - Saxo refresh tokens have a limited lifetime (typically 1 hour)
+  - Integration now checks if refresh token is expired before attempting refresh
+  - Triggers automatic reauth flow when refresh token has expired
+  - Prevents 401 errors from trying to use expired refresh tokens
+  - Provides clear error messages explaining the issue
+
+### Changed
+- Enhanced `_check_and_refresh_token()` to validate refresh token expiry (coordinator.py:299-329)
+  - Calculates refresh token expiration time based on `refresh_token_expires_in`
+  - Logs refresh token expiration information for debugging
+  - Raises ConfigEntryAuthFailed with helpful message when refresh token expired
+  - Home Assistant will automatically prompt for reauth when this occurs
+
+### Technical Details
+- Refresh token expiry calculation: `token_issued_at + refresh_token_expires_in`
+- Prevents wasted API calls with expired credentials
+- Clearer user experience with automatic reauth prompts
+- INFO-level logging shows refresh token expiration time
+
+## [2.2.17] - 2025-10-27
+
+### Changed
+- **Enhanced Diagnostics**: Added comprehensive logging for OAuth token refresh debugging
+  - INFO-level logging now shows client_id and redirect_uri being used for token refresh
+  - Logs source of redirect_uri (OAuth implementation vs config entry vs none)
+  - Added helpful error messages for 401 errors with troubleshooting steps
+  - Logs masked client_id (first 8 characters) to help identify configuration issues
+  - Provides clear guidance on potential causes: redirect_uri mismatch, invalid credentials, reconfiguration needed
+
+### Technical Details
+- Enhanced `_refresh_oauth_token()` method with comprehensive diagnostic logging
+- All key OAuth refresh parameters now logged at INFO level (no debug logging needed)
+- 401 errors now include specific troubleshooting suggestions
+- Helps diagnose redirect_uri mismatches and credential issues
+
+## [2.2.16] - 2025-10-27
+
+### Fixed
+- **Critical**: Fixed OAuth token refresh 401 Unauthorized errors (partial fix)
+  - Token refresh was using hardcoded redirect_uri instead of the actual redirect_uri from initial authorization
+  - OAuth 2.0 requires redirect_uri in refresh requests to match the one used during initial authorization
+  - Now properly retrieves redirect_uri from OAuth implementation object (coordinator.py:355-407)
+  - Falls back to stored redirect_uri in config entry if implementation is unavailable
+  - Integration will now successfully refresh tokens and maintain authentication
+
+### Changed
+- Enhanced config flow to properly store redirect_uri during initial setup (config_flow.py:128-157)
+  - Retrieves redirect_uri from OAuth implementation instead of using hardcoded value
+  - Includes proper error handling and fallback mechanisms
+  - Improves reliability of token refresh operations
+
+### Technical Details
+- Modified `_refresh_oauth_token()` in coordinator.py to use `implementation.redirect_uri`
+- Enhanced logging to show which redirect_uri is being used for token refresh
+- Only uses hardcoded fallback as last resort with warning message
+- Ensures OAuth 2.0 compliance for token refresh operations
+
 ## [2.2.15] - 2025-10-13
 
 ### Added

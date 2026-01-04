@@ -137,16 +137,22 @@ ERROR_NETWORK_ERROR: Final = "Network error occurred while fetching data."
 
 
 # Home Assistant specific
-PLATFORMS: Final = ["sensor"]
+PLATFORMS: Final = ["button", "sensor"]
 # Data storage keys
 DATA_COORDINATOR: Final = "coordinator"
 DATA_UNSUB: Final = "unsub"
+
+# Services
+SERVICE_REFRESH_DATA: Final = "refresh_data"
 
 # Token management
 TOKEN_REFRESH_BUFFER: Final = timedelta(
     minutes=5
 )  # Refresh token 5 minutes before expiry
 TOKEN_MIN_VALIDITY: Final = timedelta(minutes=10)  # Minimum time token should be valid
+REFRESH_TOKEN_BUFFER: Final = timedelta(
+    minutes=5
+)  # Proactively refresh when refresh token has less than 5 minutes left
 
 # API timeouts
 API_TIMEOUT_CONNECT: Final = 10  # seconds

@@ -36,6 +36,7 @@ class SaxoPortfolioFlowHandler(
         super().__init__()
         self._user_input: dict[str, Any] = {}
         self._oauth_data: dict[str, Any] = {}
+        self._reauth_entry: config_entries.ConfigEntry | None = None
 
     @property
     def logger(self) -> logging.Logger:
@@ -110,7 +111,40 @@ class SaxoPortfolioFlowHandler(
 
     async def async_oauth_create_entry(self, data: dict[str, Any]) -> FlowResult:
         """Create an entry for the flow."""
-        # Store OAuth data and proceed to timezone configuration
+        # Add token_issued_at timestamp if not present
+        # This helps accurately track refresh token expiry
+        from datetime import datetime
+
+        if "token" in data and "token_issued_at" not in data["token"]:
+            data["token"]["token_issued_at"] = datetime.now().timestamp()
+
+        # Check if this is a reauth flow
+        if self._reauth_entry:
+            # Update existing entry with new token
+            _LOGGER.info(
+                "Reauth successful, updating config entry: %s",
+                self._reauth_entry.title,
+            )
+
+            # Preserve existing configuration (timezone, etc.) and update only the token
+            new_data = {**self._reauth_entry.data}
+            new_data["token"] = data["token"]
+
+            # Preserve redirect_uri if available in new OAuth data
+            if "redirect_uri" in data:
+                new_data["redirect_uri"] = data["redirect_uri"]
+
+            self.hass.config_entries.async_update_entry(
+                self._reauth_entry,
+                data=new_data,
+            )
+
+            # Reload the integration to use the new token
+            await self.hass.config_entries.async_reload(self._reauth_entry.entry_id)
+
+            return self.async_abort(reason="reauth_successful")
+
+        # Not a reauth flow - store OAuth data and proceed to timezone configuration
         self._oauth_data = data
         return await self.async_step_timezone()
 
@@ -125,8 +159,36 @@ class SaxoPortfolioFlowHandler(
             data = {**self._oauth_data}
             data[CONF_TIMEZONE] = user_input[CONF_TIMEZONE]
 
-            # Add redirect_uri for token refresh (required by Saxo)
-            data["redirect_uri"] = "https://my.home-assistant.io/redirect/oauth"
+            # Store redirect_uri from OAuth implementation for token refresh
+            # This is retrieved dynamically by Home Assistant based on the configuration
+            try:
+                from homeassistant.helpers.config_entry_oauth2_flow import (
+                    async_get_implementations,
+                )
+
+                implementations = await async_get_implementations(self.hass, DOMAIN)
+                if implementations:
+                    # Get the first (and typically only) implementation
+                    implementation = next(iter(implementations.values()))
+                    if hasattr(implementation, "redirect_uri"):
+                        data["redirect_uri"] = implementation.redirect_uri
+                        _LOGGER.debug(
+                            "Stored redirect_uri from OAuth implementation: %s",
+                            implementation.redirect_uri,
+                        )
+                    else:
+                        _LOGGER.debug(
+                            "OAuth implementation has no redirect_uri property, will retrieve dynamically during refresh"
+                        )
+                else:
+                    _LOGGER.warning(
+                        "No OAuth implementations found during setup, redirect_uri will be retrieved dynamically during refresh"
+                    )
+            except Exception as e:
+                _LOGGER.warning(
+                    "Could not retrieve redirect_uri during setup: %s, will retrieve dynamically during refresh",
+                    type(e).__name__,
+                )
 
             # Debug OAuth data structure (without sensitive info)
             debug_data = {k: v for k, v in data.items() if k != "token"}
@@ -171,7 +233,63 @@ class SaxoPortfolioFlowHandler(
 
     async def async_step_reauth(self, entry_data: dict[str, Any]) -> FlowResult:
         """Handle reauthorization request."""
-        return await self.async_step_user()
+        # Get the config entry that triggered reauth
+        entry_id = self.context.get("entry_id")
+        if entry_id:
+            self._reauth_entry = self.hass.config_entries.async_get_entry(entry_id)
+            _LOGGER.info(
+                "Starting reauth flow for config entry: %s",
+                self._reauth_entry.title if self._reauth_entry else "unknown",
+            )
+        else:
+            _LOGGER.warning("Reauth triggered but no entry_id in context")
+
+        # Show confirmation form to user first
+        return await self.async_step_reauth_confirm()
+
+    async def async_step_reauth_confirm(
+        self, user_input: dict[str, Any] | None = None
+    ) -> FlowResult:
+        """Confirm reauth dialog."""
+        if user_input is not None:
+            # User clicked Submit/Continue - start OAuth flow
+            return await self.async_step_pick_implementation()
+
+        # Show the confirmation form
+        return self.async_show_form(
+            step_id="reauth_confirm",
+            description_placeholders={
+                "title": self._reauth_entry.title
+                if self._reauth_entry
+                else "Saxo Portfolio"
+            },
+        )
+
+    async def async_step_reconfigure(
+        self, user_input: dict[str, Any] | None = None
+    ) -> FlowResult:
+        """Handle reconfiguration request (manual reauthentication)."""
+        # Get the config entry being reconfigured using HA's built-in method
+        reconfigure_entry = self._get_reconfigure_entry()
+        self._reauth_entry = reconfigure_entry
+
+        _LOGGER.info(
+            "Reconfigure flow for config entry: %s (entry_id: %s)",
+            reconfigure_entry.title,
+            reconfigure_entry.entry_id,
+        )
+
+        if user_input is not None:
+            # User clicked Submit - start OAuth flow
+            return await self.async_step_pick_implementation()
+
+        # Show the confirmation form
+        return self.async_show_form(
+            step_id="reconfigure",
+            description_placeholders={
+                "title": reconfigure_entry.title,
+            },
+        )
 
     @staticmethod
     @config_entries.callback
